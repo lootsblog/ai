@@ -113,3 +113,27 @@ After:
         log.info("Used Heap: {}MB", (totalHeap - freeHeap) / 1024 / 1024);
         log.info("Available for allocation: {}MB", (maxHeap - totalHeap + freeHeap) / 1024 / 1024);
         log.info("=========================================");
+
+# Use Java 17+ base image
+FROM openjdk:17-jdk-slim
+
+# Set working directory
+WORKDIR /app
+
+# Copy the JAR file (adjust the path to your JAR file)
+COPY target/export-service-*.jar app.jar
+
+# Set JVM options for container environment
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75.0 \
+               -XX:InitialRAMPercentage=25.0 \
+               -XX:+UseG1GC \
+               -XX:+UseContainerSupport \
+               -XX:+PrintGCDetails \
+               -XX:+PrintGCTimeStamps \
+               -Djava.security.egd=file:/dev/./urandom"
+
+# Expose port (adjust if your app uses different port)
+EXPOSE 8080
+
+# Run the application with JVM options
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
