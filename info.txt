@@ -137,3 +137,17 @@ EXPOSE 8080
 
 # Run the application with JVM options
 ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+
+Memory-
+-XX:MaxRAMPercentage=75.0        # Use 75% of container memory for heap
+-XX:InitialRAMPercentage=25.0    # Start with 25% of container memory
+-XX:+UseContainerSupport         # Enable container-aware JVM
+Debugging-
+-XX:+PrintGCDetails              # Print GC information
+-XX:+PrintGCTimeStamps           # Print GC timestamps
+-XX:+HeapDumpOnOutOfMemoryError  # Create heap dump on OOM
+-XX:HeapDumpPath=/tmp/heapdump.hprof  # Where to save heap dump
+
+performance -
+-Djava.security.egd=file:/dev/./urandom  # Faster random number generation
+
