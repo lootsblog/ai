@@ -3,11 +3,11 @@ package com.example.Export;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
@@ -23,10 +23,9 @@ import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
+@Slf4j
 @Service
 public class ExcelExportService {
-    
-    private static final Logger log = LoggerFactory.getLogger(ExcelExportService.class);
     
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpMethodHandler httpMethodHandler;
@@ -45,15 +44,17 @@ public class ExcelExportService {
     
     /**
      * Main method to generate ZIP file containing multiple Excel files
+     * @param filterBody The filter criteria received from API call
+     * @return ZIP file as byte array containing multiple Excel files
      */
-    public byte[] generateExcelZip() throws IOException {
+    public byte[] generateExcelZip(JsonNode filterBody) throws IOException {
         log.info("Starting ZIP-based Excel export process");
         
         try (ByteArrayOutputStream zipByteStream = new ByteArrayOutputStream();
              ZipOutputStream zipStream = new ZipOutputStream(zipByteStream)) {
             
             ZipExportContext context = new ZipExportContext(zipStream);
-            processAssetsInBatches(context);
+            processAssetsInBatches(context, filterBody);
             finalizePendingExcel(context);
             
             zipStream.finish();
@@ -70,37 +71,64 @@ public class ExcelExportService {
     }
     
     /**
-     * Process assets in batches and create Excel files as needed
+     * Process assets in batches continuously until all data is fetched
      */
-    private void processAssetsInBatches(ZipExportContext context) throws IOException {
+    private void processAssetsInBatches(ZipExportContext context, JsonNode filterBody) throws IOException {
+        boolean hasMore = true;
+        int currentOffset = 0;
+        
+        while (hasMore) {
+            // Fetch batch of assets using parallel API calls
+            List<JsonNode> batchAssets = fetchAssetBatch(filterBody, currentOffset);
+            
+            if (batchAssets.isEmpty()) {
+                break;
+            }
+            
+            // Process this batch - create Excel files as needed
+            processAssetBatch(context, batchAssets);
+            
+            // Update for next iteration
+            currentOffset += BATCH_SIZE;
+            hasMore = batchAssets.size() == BATCH_SIZE;
+            
+            log.info("Processed batch: {} assets. Total processed: {}", 
+                batchAssets.size(), context.getTotalAssetsProcessed());
+        }
+    }
+    
+    /**
+     * Fetch a batch of assets using parallel API calls (your existing logic)
+     */
+    private List<JsonNode> fetchAssetBatch(JsonNode filterBody, int startOffset) {
         ExecutorService executor = null;
         
         try {
             executor = Executors.newFixedThreadPool(PARALLEL_CALLS);
-            JsonNode filterBody = createFilterBody(); // Your existing filter logic
+            List<CompletableFuture<List<JsonNode>>> batchFutures = new ArrayList<>();
             
-            boolean hasMore = true;
-            int currentOffset = 0;
-            
-            while (hasMore) {
-                // Fetch batch of assets using existing parallel logic
-                List<JsonNode> batchAssets = fetchAssetBatch(executor, filterBody, currentOffset);
+            // Launch parallel calls for this batch
+            for (int i = 0; i < PARALLEL_CALLS; i++) {
+                final int offset = startOffset + (i * PAGE_SIZE);
                 
-                if (batchAssets.isEmpty()) {
-                    break;
-                }
-                
-                // Process this batch
-                processAssetBatch(context, batchAssets);
-                
-                // Update for next iteration
-                currentOffset += BATCH_SIZE;
-                hasMore = batchAssets.size() == BATCH_SIZE;
-                
-                log.info("Processed batch: {} assets. Total processed: {}", 
-                    batchAssets.size(), context.getTotalAssetsProcessed());
+                batchFutures.add(CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return fetchAssetsFromAPI(filterBody, offset);
+                    } catch (IOException e) {
+                        throw new CompletionException(e);
+                    }
+                }, executor));
             }
             
+            // Wait for batch to complete and collect results
+            return batchFutures.stream()
+                .map(CompletableFuture::join)
+                .flatMap(List::stream)
+                .collect(Collectors.toList());
+                
+        } catch (CompletionException e) {
+            log.error("Failed to fetch asset batch: {}", e.getMessage());
+            throw new RuntimeException("Failed to fetch asset batch", e);
         } finally {
             if (executor != null) {
                 executor.shutdown();
@@ -109,33 +137,7 @@ public class ExcelExportService {
     }
     
     /**
-     * Fetch a batch of assets using parallel API calls
-     */
-    private List<JsonNode> fetchAssetBatch(ExecutorService executor, JsonNode filterBody, int startOffset) {
-        List<CompletableFuture<List<JsonNode>>> batchFutures = new ArrayList<>();
-        
-        // Launch parallel calls for this batch
-        for (int i = 0; i < PARALLEL_CALLS; i++) {
-            final int offset = startOffset + (i * PAGE_SIZE);
-            
-            batchFutures.add(CompletableFuture.supplyAsync(() -> {
-                try {
-                    return fetchAssetsFromAPI(filterBody, offset);
-                } catch (IOException e) {
-                    throw new CompletionException(e);
-                }
-            }, executor));
-        }
-        
-        // Wait for batch to complete and collect results
-        return batchFutures.stream()
-            .map(CompletableFuture::join)
-            .flatMap(List::stream)
-            .collect(Collectors.toList());
-    }
-    
-    /**
-     * Process a batch of assets, creating Excel files as needed
+     * Process a batch of assets, creating Excel files as needed based on row limits
      */
     private void processAssetBatch(ZipExportContext context, List<JsonNode> assets) throws IOException {
         for (JsonNode asset : assets) {
@@ -207,7 +209,7 @@ public class ExcelExportService {
     }
     
     /**
-     * Finalize any pending Excel file at the end
+     * Finalize any pending Excel file at the end of processing
      */
     private void finalizePendingExcel(ZipExportContext context) throws IOException {
         if (context.hasAssetsInCurrentExcel()) {
@@ -228,7 +230,7 @@ public class ExcelExportService {
     }
     
     /**
-     * Generate bytes from Excel workbook
+     * Generate bytes from Excel workbook and properly dispose resources
      */
     private byte[] generateExcelBytes(Workbook workbook) throws IOException {
         try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
@@ -239,20 +241,12 @@ public class ExcelExportService {
         }
     }
     
-    /**
-     * Create filter body for API calls - implement your existing logic
-     */
-    private JsonNode createFilterBody() {
-        // TODO: Implement your existing filter body creation logic
-        return objectMapper.createObjectNode();
-    }
-    
-    // ========== Existing methods (unchanged) ==========
+    // ========== Existing methods (unchanged but with proper error handling) ==========
     
     /**
      * Keep the original single Excel generation for backward compatibility
      */
-    public byte[] generateExcel() throws IOException {
+    public byte[] generateExcel(JsonNode filterBody) throws IOException {
         ExecutorService executor = null;
         try {
             executor = Executors.newFixedThreadPool(PARALLEL_CALLS);
@@ -260,7 +254,6 @@ public class ExcelExportService {
             boolean hasMore = true;
             int currentOffset = 0;
             int totalProcessed = 0;
-            JsonNode filterBody = createFilterBody();
             
             while (hasMore) {
                 List<CompletableFuture<List<JsonNode>>> batchFutures = new ArrayList<>();
@@ -286,7 +279,7 @@ public class ExcelExportService {
                     .collect(Collectors.toList());
                 
                 // Check if this was the last page
-                if (batchResults.size() < PAGE_SIZE) {
+                if (batchResults.size() < BATCH_SIZE) {
                     hasMore = false;
                 }
                 
@@ -314,7 +307,7 @@ public class ExcelExportService {
     }
     
     /**
-     * This method simulates API call but reads from mock JSON file
+     * API call to fetch assets with pagination
      */
     public List<JsonNode> fetchAssetsFromAPI(JsonNode filterBody, int offset) throws IOException {
         FilterBodyDto apiFilterBody = new FilterBodyDto();
@@ -328,6 +321,8 @@ public class ExcelExportService {
         apiFilterBody.setPagination(pagination);
         
         // In real implementation, this would be your HTTP call
+        // ResponseEntity<List<JsonNode>> response = restTemplate.exchange(...)
+        
         // For now, read from mock JSON file
         ClassPathResource resource = new ClassPathResource("mock-assets.json");
         try (InputStream inputStream = resource.getInputStream()) {
@@ -335,6 +330,9 @@ public class ExcelExportService {
         }
     }
     
+    /**
+     * Create single Excel file from all assets (backward compatibility)
+     */
     private byte[] createExcelFromAssets(List<JsonNode> assets) throws IOException {
         try (Workbook workbook = new XSSFWorkbook()) {
             ExcelBuilder builder = new ExcelBuilder(workbook);
@@ -343,13 +341,16 @@ public class ExcelExportService {
                 builder.addAsset(asset);
             }
             
-            // Return as byte array
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            workbook.write(outputStream);
-            return outputStream.toByteArray();
+            try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+                workbook.write(outputStream);
+                return outputStream.toByteArray();
+            }
         }
     }
     
+    /**
+     * Calculate maximum rows needed for an asset (your existing logic)
+     */
     private int calculateMaxRows(JsonNode asset) {
         int maxRows = 1; // At least one row for simple fields
         
@@ -371,8 +372,9 @@ public class ExcelExportService {
     // ========== Inner Classes ==========
     
     /**
-     * Context class to track ZIP export state
+     * Context class to track ZIP export state - encapsulates all state variables
      */
+    @Data
     private static class ZipExportContext {
         private final ZipOutputStream zipStream;
         private Workbook currentExcel;
@@ -386,21 +388,28 @@ public class ExcelExportService {
             this.zipStream = zipStream;
         }
         
-        // Getters and setters
-        public ZipOutputStream getZipStream() { return zipStream; }
-        public Workbook getCurrentExcel() { return currentExcel; }
-        public void setCurrentExcel(Workbook currentExcel) { this.currentExcel = currentExcel; }
-        public ExcelBuilder getCurrentExcelBuilder() { return currentExcelBuilder; }
-        public void setCurrentExcelBuilder(ExcelBuilder currentExcelBuilder) { this.currentExcelBuilder = currentExcelBuilder; }
-        public int getCurrentExcelRowCount() { return currentExcelRowCount; }
-        public void incrementRowCount(int rows) { this.currentExcelRowCount += rows; }
-        public void resetCurrentExcelRowCount() { this.currentExcelRowCount = 0; this.assetsInCurrentExcel = 0; }
-        public boolean hasAssetsInCurrentExcel() { return assetsInCurrentExcel > 0; }
-        public int getAssetsInCurrentExcel() { return assetsInCurrentExcel; }
-        public void incrementAssetCount() { this.assetsInCurrentExcel++; this.totalAssetsProcessed++; }
-        public int getCompletedExcelFiles() { return completedExcelFiles; }
-        public void incrementCompletedExcelFiles() { this.completedExcelFiles++; }
-        public int getTotalAssetsProcessed() { return totalAssetsProcessed; }
+        public void incrementRowCount(int rows) { 
+            this.currentExcelRowCount += rows; 
+        }
+        
+        public void resetCurrentExcelRowCount() { 
+            this.currentExcelRowCount = 0; 
+            this.assetsInCurrentExcel = 0; 
+        }
+        
+        public boolean hasAssetsInCurrentExcel() { 
+            return assetsInCurrentExcel > 0; 
+        }
+        
+        public void incrementAssetCount() { 
+            this.assetsInCurrentExcel++; 
+            this.totalAssetsProcessed++; 
+        }
+        
+        public void incrementCompletedExcelFiles() { 
+            this.completedExcelFiles++; 
+        }
+        
         public void clearCurrentExcel() { 
             this.currentExcel = null; 
             this.currentExcelBuilder = null;
@@ -408,7 +417,7 @@ public class ExcelExportService {
     }
     
     /**
-     * Builder class to handle Excel creation logic
+     * Builder class to handle Excel creation logic - encapsulates Excel file building
      */
     private class ExcelBuilder {
         private final Workbook workbook;
@@ -434,9 +443,7 @@ public class ExcelExportService {
             currentRow = processAsset(sheet, workbook, asset, currentRow);
         }
         
-        // Use your existing Excel creation methods
         private int processAsset(Sheet sheet, Workbook workbook, JsonNode asset, int currentRow) {
-            // Your existing processAsset implementation
             int maxRows = calculateMaxRows(asset);
             
             CellStyle dataStyle = createDataStyle(workbook);
@@ -451,8 +458,219 @@ public class ExcelExportService {
             return currentRow;
         }
         
-        // Include all your existing Excel creation helper methods here
-        // (createGroupHeaders, createColumnHeaders, buildRowData, etc.)
-        // I'm not duplicating them to keep the code concise
+        private Map<String, String> buildRowData(JsonNode asset, int arrayIndex) {
+            Map<String, String> rowData = new HashMap<>();
+            
+            for (Map.Entry<String, FieldMappingConfig.FieldMetadata> entry : FieldMappingConfig.FIELD_CONFIG.entrySet()) {
+                String fieldName = entry.getKey();
+                FieldMappingConfig.FieldMetadata metadata = entry.getValue();
+                
+                String value = extractValueBasedOnType(asset, fieldName, metadata, arrayIndex);
+                rowData.put(fieldName, value);
+            }
+            
+            return rowData;
+        }
+        
+        private String extractValueBasedOnType(JsonNode asset, String fieldName, FieldMappingConfig.FieldMetadata metadata, int arrayIndex) {
+            switch (metadata.type) {
+                case SIMPLE:
+                    return arrayIndex == 0 ? getSimpleValue(asset, fieldName) : "";
+                case ARRAY:
+                    return getArrayValue(asset, metadata.sourceArray, metadata.sourceField, arrayIndex);
+                case COMMA_SEPARATED:
+                    return arrayIndex == 0 ? getCommaSeparatedValue(asset, fieldName) : "";
+                default:
+                    return "";
+            }
+        }
+        
+        private String getSimpleValue(JsonNode asset, String fieldName) {
+            JsonNode value = asset.get(fieldName);
+            if (value == null || value.isNull()) {
+                return "";
+            }
+            
+            String stringValue = value.asText();
+            
+            if (fieldName.contains("Date") && stringValue.contains("T")) {
+                return stringValue.replace("T", " ").replace("Z", "");
+            }
+            
+            return stringValue;
+        }
+        
+        private String getArrayValue(JsonNode asset, String sourceArray, String sourceField, int arrayIndex) {
+            JsonNode arrayNode = asset.get(sourceArray);
+            if (arrayNode == null || !arrayNode.isArray() || arrayIndex >= arrayNode.size()) {
+                return "";
+            }
+            
+            JsonNode item = arrayNode.get(arrayIndex);
+            if (item == null) {
+                return "";
+            }
+            
+            JsonNode fieldValue = item.get(sourceField);
+            if (fieldValue == null || fieldValue.isNull()) {
+                return "";
+            }
+            
+            String stringValue = fieldValue.asText();
+            
+            if ((sourceField.equals("start") || sourceField.equals("end")) && stringValue.contains("T")) {
+                return stringValue.replace("T", " ").replace("Z", "");
+            }
+            
+            return stringValue;
+        }
+        
+        private String getCommaSeparatedValue(JsonNode asset, String fieldName) {
+            JsonNode value = asset.get(fieldName);
+            if (value == null || value.isNull()) {
+                return "";
+            }
+            
+            if (value.isArray()) {
+                List<String> items = new ArrayList<>();
+                for (JsonNode item : value) {
+                    items.add(item.asText());
+                }
+                return String.join(", ", items);
+            }
+            
+            return value.asText();
+        }
+        
+        private void createExcelRow(Sheet sheet, Map<String, String> rowData, CellStyle dataStyle, int rowIndex) {
+            Row row = sheet.createRow(rowIndex);
+            String[] fields = FieldMappingConfig.getFieldsInOrder();
+            
+            for (int i = 0; i < fields.length; i++) {
+                Cell cell = row.createCell(i);
+                cell.setCellStyle(dataStyle);
+                
+                String value = rowData.get(fields[i]);
+                cell.setCellValue(value != null ? value : "");
+            }
+        }
+        
+        private void addBottomBorderToRow(Sheet sheet, CellStyle borderStyle, int rowIndex) {
+            Row row = sheet.getRow(rowIndex);
+            if (row != null) {
+                String[] fields = FieldMappingConfig.getFieldsInOrder();
+                for (int i = 0; i < fields.length; i++) {
+                    Cell cell = row.getCell(i);
+                    if (cell != null) {
+                        cell.setCellStyle(borderStyle);
+                    }
+                }
+            }
+        }
+    }
+    
+    // ========== Style Creation Methods ==========
+    
+    private int createGroupHeaders(Sheet sheet, Workbook workbook, int rowIndex) {
+        Row row = sheet.createRow(rowIndex);
+        String[] groups = FieldMappingConfig.getGroupsInOrder();
+        String[] fields = FieldMappingConfig.getFieldsInOrder();
+        
+        int colIndex = 0;
+        for (String group : groups) {
+            CellStyle groupStyle = createGroupHeaderStyle(workbook, group);
+            
+            int groupStartCol = colIndex;
+            int groupColCount = FieldMappingConfig.countColumnsInGroup(fields, group);
+            
+            if (groupColCount > 0) {
+                Cell cell = row.createCell(groupStartCol);
+                cell.setCellValue(group);
+                cell.setCellStyle(groupStyle);
+                
+                if (groupColCount > 1) {
+                    sheet.addMergedRegion(new CellRangeAddress(
+                        rowIndex, rowIndex, groupStartCol, groupStartCol + groupColCount - 1));
+                }
+                
+                colIndex += groupColCount;
+            }
+        }
+        
+        return rowIndex + 1;
+    }
+    
+    private int createColumnHeaders(Sheet sheet, Workbook workbook, int rowIndex) {
+        Row row = sheet.createRow(rowIndex);
+        String[] fields = FieldMappingConfig.getFieldsInOrder();
+        CellStyle columnHeaderStyle = createColumnHeaderStyle(workbook);
+        
+        for (int i = 0; i < fields.length; i++) {
+            Cell cell = row.createCell(i);
+            FieldMappingConfig.FieldMetadata metadata = FieldMappingConfig.FIELD_CONFIG.get(fields[i]);
+            String columnName = metadata != null ? metadata.columnName : fields[i];
+            cell.setCellValue(columnName);
+            cell.setCellStyle(columnHeaderStyle);
+        }
+        
+        return rowIndex + 1;
+    }
+    
+    private CellStyle createGroupHeaderStyle(Workbook workbook, String group) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontHeightInPoints((short) 12);
+        style.setFont(font);
+        
+        IndexedColors color = FieldMappingConfig.GROUP_COLORS.getOrDefault(
+            group, IndexedColors.LIGHT_BLUE);
+        style.setFillForegroundColor(color.getIndex());
+        style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        
+        style.setAlignment(HorizontalAlignment.CENTER);
+        style.setBorderBottom(BorderStyle.THIN);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        return style;
+    }
+    
+    private CellStyle createColumnHeaderStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontHeightInPoints((short) 10);
+        style.setFont(font);
+        style.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+        style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        style.setAlignment(HorizontalAlignment.CENTER);
+        style.setBorderBottom(BorderStyle.THIN);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        return style;
+    }
+    
+    private CellStyle createDataStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        style.setAlignment(HorizontalAlignment.LEFT);
+        style.setVerticalAlignment(VerticalAlignment.TOP);
+        style.setBorderBottom(BorderStyle.THIN);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        return style;
+    }
+    
+    private CellStyle createBottomBorderStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        style.setAlignment(HorizontalAlignment.LEFT);
+        style.setVerticalAlignment(VerticalAlignment.TOP);
+        style.setBorderBottom(BorderStyle.THICK);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        return style;
     }
 }
